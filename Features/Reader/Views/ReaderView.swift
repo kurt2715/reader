@@ -437,6 +437,7 @@ private struct ReaderHTMLView: NSViewRepresentable {
     let tableOfContents: [BookTOCItem]
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        private let debugEnabled = true
         let navigationManager = ReadingNavigationManager.shared
         let searchManager = ReadingSearchManager.shared
         let tocManager = ReadingTOCManager.shared
@@ -449,6 +450,8 @@ private struct ReaderHTMLView: NSViewRepresentable {
         var tocOwnerID: String = ""
         var tocItems: [BookTOCItem] = []
         weak var webView: WKWebView?
+        weak var observedWindow: NSWindow?
+        var lastStyleSignature: String?
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             guard let script = pendingStyleScript else { return }
@@ -500,7 +503,7 @@ private struct ReaderHTMLView: NSViewRepresentable {
             }
 
             webView.evaluateJavaScript("window.__readerPushPos && window.__readerPushPos();") { result, _ in
-                let depth = result as? Int ?? 0
+                let depth = Self.jsInt(result)
                 Task { @MainActor in
                     self.navigationManager.updateCanGoBack(depth > 0)
                 }
@@ -515,11 +518,14 @@ private struct ReaderHTMLView: NSViewRepresentable {
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard message.name == "readerNav" else { return }
             guard let payload = message.body as? [String: Any] else { return }
+            if debugEnabled {
+                print("[ReaderDebug][HTML][message]", payload)
+            }
 
             if let messageType = payload["type"] as? String {
                 switch messageType {
                 case "stack":
-                    let depth = payload["depth"] as? Int ?? 0
+                    let depth = Self.jsInt(payload["depth"])
                     Task { @MainActor in
                         navigationManager.updateCanGoBack(depth > 0)
                     }
@@ -547,7 +553,10 @@ private struct ReaderHTMLView: NSViewRepresentable {
         func goBackToPreviousPosition() {
             guard let webView else { return }
             webView.evaluateJavaScript("window.__readerGoBackPos && window.__readerGoBackPos();") { result, _ in
-                let depth = result as? Int ?? 0
+                let depth = Self.jsInt(result)
+                if self.debugEnabled {
+                    print("[ReaderDebug][HTML][goBack] depth=\(depth)")
+                }
                 Task { @MainActor in
                     self.navigationManager.updateCanGoBack(depth > 0)
                 }
@@ -557,7 +566,10 @@ private struct ReaderHTMLView: NSViewRepresentable {
         func pushCurrentPosition() {
             guard let webView else { return }
             webView.evaluateJavaScript("window.__readerPushPos && window.__readerPushPos();") { result, _ in
-                let depth = result as? Int ?? 0
+                let depth = Self.jsInt(result)
+                if self.debugEnabled {
+                    print("[ReaderDebug][HTML][push] depth=\(depth)")
+                }
                 Task { @MainActor in
                     self.navigationManager.updateCanGoBack(depth > 0)
                 }
@@ -595,7 +607,16 @@ private struct ReaderHTMLView: NSViewRepresentable {
                     },
                     activate: { token in
                         guard let tokenLiteral = Self.jsStringLiteral(token) else { return }
-                        webView.evaluateJavaScript("window.__readerJumpToSearchToken && window.__readerJumpToSearchToken(\(tokenLiteral));", completionHandler: nil)
+                        let script = """
+                        (() => {
+                          const depth = window.__readerPushPos ? window.__readerPushPos() : 0;
+                          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.readerNav) {
+                            window.webkit.messageHandlers.readerNav.postMessage({ type: 'stack', depth });
+                          }
+                          return window.__readerJumpToSearchToken && window.__readerJumpToSearchToken(\(tokenLiteral));
+                        })();
+                        """
+                        webView.evaluateJavaScript(script, completionHandler: nil)
                     }
                 )
             )
@@ -634,10 +655,64 @@ private struct ReaderHTMLView: NSViewRepresentable {
             }
         }
 
+        func attachWindowResizeObserversIfNeeded(for view: NSView) {
+            guard let window = view.window else { return }
+            if observedWindow === window { return }
+            detachWindowResizeObservers()
+            observedWindow = window
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onWindowWillStartLiveResize(_:)),
+                name: NSWindow.willStartLiveResizeNotification,
+                object: window
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onWindowDidEndLiveResize(_:)),
+                name: NSWindow.didEndLiveResizeNotification,
+                object: window
+            )
+        }
+
+        func detachWindowResizeObservers() {
+            if let observedWindow {
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: NSWindow.willStartLiveResizeNotification,
+                    object: observedWindow
+                )
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: NSWindow.didEndLiveResizeNotification,
+                    object: observedWindow
+                )
+            }
+            observedWindow = nil
+        }
+
+        @objc func onWindowWillStartLiveResize(_ notification: Notification) {
+            guard notification.object as? NSWindow === observedWindow else { return }
+            webView?.evaluateJavaScript("window.__readerCaptureResizeAnchor && window.__readerCaptureResizeAnchor();", completionHandler: nil)
+        }
+
+        @objc func onWindowDidEndLiveResize(_ notification: Notification) {
+            guard notification.object as? NSWindow === observedWindow else { return }
+            webView?.evaluateJavaScript("window.__readerRestoreResizeAnchor && window.__readerRestoreResizeAnchor();", completionHandler: nil)
+        }
+
         private func jumpToTOCToken(_ token: String) {
             guard let webView else { return }
             if let tokenLiteral = Self.jsStringLiteral(token) {
-                webView.evaluateJavaScript("window.__readerJumpToHref && window.__readerJumpToHref('#' + \(tokenLiteral));", completionHandler: nil)
+                let script = """
+                (() => {
+                  const depth = window.__readerPushPos ? window.__readerPushPos() : 0;
+                  if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.readerNav) {
+                    window.webkit.messageHandlers.readerNav.postMessage({ type: 'stack', depth });
+                  }
+                  return window.__readerJumpToHref && window.__readerJumpToHref('#' + \(tokenLiteral));
+                })();
+                """
+                webView.evaluateJavaScript(script, completionHandler: nil)
             }
         }
 
@@ -659,6 +734,13 @@ private struct ReaderHTMLView: NSViewRepresentable {
                 return nil
             }
             return String(encoded.dropFirst().dropLast())
+        }
+
+        private static func jsInt(_ value: Any?) -> Int {
+            if let intValue = value as? Int { return intValue }
+            if let number = value as? NSNumber { return number.intValue }
+            if let doubleValue = value as? Double { return Int(doubleValue) }
+            return 0
         }
     }
 
@@ -685,17 +767,22 @@ private struct ReaderHTMLView: NSViewRepresentable {
         context.coordinator.tocOwnerID = "toc:html:\(progressKey)"
         context.coordinator.pendingInitialRestoreRatio = context.coordinator.progressStore.progress(for: progressKey)?.textScrollRatio
         context.coordinator.webView = webView
-        context.coordinator.registerBackHandler()
-        context.coordinator.registerSearchProvider()
-        context.coordinator.registerTOCProvider()
         webView.setValue(false, forKey: "drawsBackground")
         webView.loadHTMLString(htmlDocument(for: htmlBody), baseURL: nil)
         context.coordinator.lastHTMLBody = htmlBody
+        context.coordinator.lastStyleSignature = styleSignature
         context.coordinator.pendingStyleScript = styleUpdateScript(preservingPosition: false)
+        DispatchQueue.main.async {
+            context.coordinator.registerBackHandler()
+            context.coordinator.registerSearchProvider()
+            context.coordinator.registerTOCProvider()
+            context.coordinator.attachWindowResizeObserversIfNeeded(for: webView)
+        }
         return webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
+        context.coordinator.attachWindowResizeObserversIfNeeded(for: nsView)
         if context.coordinator.progressKey != progressKey {
             context.coordinator.unregisterSearchProvider()
             context.coordinator.unregisterTOCProvider()
@@ -711,11 +798,16 @@ private struct ReaderHTMLView: NSViewRepresentable {
 
         if context.coordinator.lastHTMLBody != htmlBody {
             context.coordinator.lastHTMLBody = htmlBody
+            context.coordinator.lastStyleSignature = styleSignature
             context.coordinator.pendingStyleScript = styleUpdateScript(preservingPosition: false)
             nsView.loadHTMLString(htmlDocument(for: htmlBody), baseURL: nil)
             return
         }
 
+        guard context.coordinator.lastStyleSignature != styleSignature else {
+            return
+        }
+        context.coordinator.lastStyleSignature = styleSignature
         nsView.evaluateJavaScript(styleUpdateScript(preservingPosition: true), completionHandler: nil)
     }
 
@@ -724,6 +816,7 @@ private struct ReaderHTMLView: NSViewRepresentable {
         coordinator.clearBackHandlerIfOwned()
         coordinator.unregisterSearchProvider()
         coordinator.unregisterTOCProvider()
+        coordinator.detachWindowResizeObservers()
     }
 
     private func htmlDocument(for bodyHTML: String) -> String {
@@ -809,6 +902,12 @@ private struct ReaderHTMLView: NSViewRepresentable {
           });
         })();
         """
+    }
+
+    private var styleSignature: String {
+        let colorHex = fontColor == .white ? "#FFFFFF" : "#000000"
+        let size = Int(fontSize.rounded())
+        return "\(size)|\(colorHex)"
     }
 
     private var positionTrackingScript: String {
@@ -961,6 +1060,76 @@ private struct ReaderHTMLView: NSViewRepresentable {
             target.scrollIntoView({ block: 'center', inline: 'nearest' });
             return true;
           };
+          const readerBlocks = () => document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,td,th');
+          const ensureReaderBlockIDs = () => {
+            let idx = 0;
+            readerBlocks().forEach((el) => {
+              if (!el.getAttribute('data-reader-block-id')) {
+                el.setAttribute('data-reader-block-id', `rb-${idx}`);
+              }
+              idx += 1;
+            });
+          };
+          const findTopVisibleBlock = () => {
+            const topY = 8;
+            for (const el of readerBlocks()) {
+              const rect = el.getBoundingClientRect();
+              if (rect.height <= 0) continue;
+              if (rect.bottom <= topY) continue;
+              return el;
+            }
+            return null;
+          };
+          window.__readerResizeAnchor = null;
+          window.__readerResizeRatioStart = null;
+          window.__readerCaptureResizeAnchor = () => {
+            ensureReaderBlockIDs();
+            const top = findTopVisibleBlock();
+            if (!top) return false;
+            const rect = top.getBoundingClientRect();
+            window.__readerResizeAnchor = {
+              id: top.getAttribute('data-reader-block-id'),
+              offset: 8 - rect.top
+            };
+            return true;
+          };
+          window.__readerRestoreResizeAnchor = () => {
+            const anchor = window.__readerResizeAnchor;
+            if (!anchor || !anchor.id) return false;
+            const target = document.querySelector(`[data-reader-block-id=\"${anchor.id}\"]`);
+            if (!target) return false;
+            const rect = target.getBoundingClientRect();
+            const desiredTop = 8 - (anchor.offset || 0);
+            window.scrollBy(0, rect.top - desiredTop);
+            return true;
+          };
+          const postResizeDebug = (phase, extra = {}) => {
+            postReaderMessage({ type: 'resize', phase, ...extra });
+          };
+          ensureReaderBlockIDs();
+          let resizeTimer = null;
+          window.addEventListener('resize', () => {
+            if (!window.__readerResizeAnchor) {
+              const maxStart = Math.max(0, document.body.scrollHeight - window.innerHeight);
+              window.__readerResizeRatioStart = maxStart > 0 ? (window.scrollY / maxStart) : 0;
+              window.__readerCaptureResizeAnchor();
+              postResizeDebug('start', { ratio: window.__readerResizeRatioStart });
+            }
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+              const ok = window.__readerRestoreResizeAnchor();
+              if (!ok) {
+                const ratio = typeof window.__readerResizeRatioStart === 'number' ? window.__readerResizeRatioStart : 0;
+                const maxAfter = Math.max(0, document.body.scrollHeight - window.innerHeight);
+                window.scrollTo(0, ratio * maxAfter);
+                postResizeDebug('fallback-ratio', { ratio });
+              } else {
+                postResizeDebug('restore-ok');
+              }
+              window.__readerResizeAnchor = null;
+              window.__readerResizeRatioStart = null;
+            }, 140);
+          }, { passive: true });
           document.addEventListener('click', (event) => {
             const anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
             if (!anchor) return;

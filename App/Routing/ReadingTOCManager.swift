@@ -45,7 +45,6 @@ final class ReadingTOCManager: ObservableObject {
 
     func activate(token: String) {
         guard let provider else { return }
-        ReadingNavigationManager.shared.pushCurrentPosition()
         provider.activate(token)
     }
 }

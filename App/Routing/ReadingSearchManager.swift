@@ -70,7 +70,6 @@ final class ReadingSearchManager: ObservableObject {
 
     func activate(_ result: ReaderSearchResult) {
         guard let provider else { return }
-        ReadingNavigationManager.shared.pushCurrentPosition()
         provider.activate(result.token)
     }
 }
