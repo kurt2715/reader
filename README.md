@@ -2,6 +2,7 @@
 
 一个面向 Apple Silicon 的 macOS 电子书阅读器，主打一个上班摸鱼功能。
 完全透明，无菜单栏，除了电子书内容文字没有任何其他东西。
+<img width="1236" height="730" alt="image" src="https://github.com/user-attachments/assets/b0adc5cf-ee10-482e-8660-1e1b649e3d2a" />
 
 - 支持格式：`txt`、`pdf`、`epub`、`mobi`、`azw3`
 - 支持透明模式、全文检索、目录跳转、返回上一个位置
