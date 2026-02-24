@@ -1,6 +1,7 @@
 # Reader (macOS)
 
-一个面向 Apple Silicon 的 macOS 电子书阅读器，强调极简阅读界面与多格式支持。
+一个面向 Apple Silicon 的 macOS 电子书阅读器，主打一个上班摸鱼功能。
+完全透明，无菜单栏，除了电子书内容文字没有任何其他东西。
 
 - 支持格式：`txt`、`pdf`、`epub`、`mobi`、`azw3`
 - 支持透明模式、全文检索、目录跳转、返回上一个位置
