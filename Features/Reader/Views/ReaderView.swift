@@ -166,10 +166,19 @@ private struct ReaderTextView: NSViewRepresentable {
         let tableOfContents: [BookTOCItem]
         weak var scrollView: NSScrollView?
         weak var textView: NSTextView?
+        weak var observedWindow: NSWindow?
         var didRestore = false
+        var restoreAttempts = 0
+        var visualAnchor: TextVisualAnchor?
+        var isRestoringVisualPosition = false
         var positionStack: [Double] = []
         var searchOwnerID: String
         var tocOwnerID: String
+
+        struct TextVisualAnchor {
+            let characterIndex: Int
+            let offsetFromAnchorLine: CGFloat
+        }
 
         init(progressKey: String, tableOfContents: [BookTOCItem]) {
             self.progressKey = progressKey
@@ -179,26 +188,178 @@ private struct ReaderTextView: NSViewRepresentable {
         }
 
         @objc func onBoundsDidChange(_ notification: Notification) {
+            if visualAnchor != nil {
+                restoreVisualPositionFromAnchor()
+                return
+            }
+            guard !isRestoringVisualPosition else { return }
+            guard didRestore else { return }
             guard let scrollView, let documentView = scrollView.documentView else { return }
             let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
             guard maxY > 0 else { return }
             let ratio = scrollView.contentView.bounds.origin.y / maxY
-            progressStore.saveTextScrollRatio(ratio, for: progressKey)
+            progressStore.saveTextPosition(ratio: ratio, characterIndex: currentTopCharacterIndex(), for: progressKey)
         }
 
         func restorePositionIfNeeded() {
             guard !didRestore else { return }
-            guard let ratio = progressStore.progress(for: progressKey)?.textScrollRatio else {
+            guard let progress = progressStore.progress(for: progressKey) else {
                 didRestore = true
                 return
             }
             guard let scrollView, let documentView = scrollView.documentView else { return }
 
+            if let textContainer = textView?.textContainer {
+                textView?.layoutManager?.ensureLayout(for: textContainer)
+            }
             let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
-            let targetY = ratio * maxY
+            if maxY <= 0 && restoreAttempts < 8 {
+                restoreAttempts += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+                    self?.restorePositionIfNeeded()
+                }
+                return
+            }
+
+            if let characterIndex = progress.textCharacterIndex {
+                visualAnchor = TextVisualAnchor(characterIndex: characterIndex, offsetFromAnchorLine: 0)
+                restoreVisualPositionFromAnchor(clearAnchor: true)
+            } else if let ratio = progress.textScrollRatio {
+                let targetY = ratio * maxY
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
+            didRestore = true
+        }
+
+        func attachWindowResizeObserversIfNeeded(for view: NSView) {
+            guard let window = view.window else { return }
+            if observedWindow === window { return }
+            detachWindowResizeObservers()
+            observedWindow = window
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onWindowWillStartLiveResize(_:)),
+                name: NSWindow.willStartLiveResizeNotification,
+                object: window
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onWindowDidEndLiveResize(_:)),
+                name: NSWindow.didEndLiveResizeNotification,
+                object: window
+            )
+        }
+
+        func detachWindowResizeObservers() {
+            if let observedWindow {
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: NSWindow.willStartLiveResizeNotification,
+                    object: observedWindow
+                )
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: NSWindow.didEndLiveResizeNotification,
+                    object: observedWindow
+                )
+            }
+            observedWindow = nil
+        }
+
+        @objc func onWindowWillStartLiveResize(_ notification: Notification) {
+            guard notification.object as? NSWindow === observedWindow else { return }
+            captureVisualPositionAnchor()
+        }
+
+        @objc func onWindowDidEndLiveResize(_ notification: Notification) {
+            guard notification.object as? NSWindow === observedWindow else { return }
+            restoreVisualPositionFromAnchor(clearAnchor: true)
+        }
+
+        func preserveVisualPosition(_ changes: () -> Void) {
+            captureVisualPositionAnchor()
+            changes()
+            restoreVisualPositionFromAnchor(clearAnchor: true)
+        }
+
+        func captureVisualPositionAnchor() {
+            guard didRestore else { return }
+            guard let scrollView, let textView, let layoutManager = textView.layoutManager, let textContainer = textView.textContainer else { return }
+            layoutManager.ensureLayout(for: textContainer)
+            let visibleRect = scrollView.contentView.bounds
+            let anchorPointInTextView = NSPoint(x: visibleRect.minX, y: visibleRect.minY + 8)
+            let containerPoint = NSPoint(
+                x: anchorPointInTextView.x - textView.textContainerOrigin.x,
+                y: anchorPointInTextView.y - textView.textContainerOrigin.y
+            )
+            guard layoutManager.numberOfGlyphs > 0 else { return }
+            let glyphIndex = min(
+                layoutManager.glyphIndex(for: containerPoint, in: textContainer),
+                max(layoutManager.numberOfGlyphs - 1, 0)
+            )
+            let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+            let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            let lineY = lineRect.minY + textView.textContainerOrigin.y
+            visualAnchor = TextVisualAnchor(
+                characterIndex: characterIndex,
+                offsetFromAnchorLine: lineY - anchorPointInTextView.y
+            )
+        }
+
+        func restoreVisualPositionFromAnchor(clearAnchor: Bool = false) {
+            guard let anchor = visualAnchor else { return }
+            guard let scrollView, let textView, let layoutManager = textView.layoutManager, let textContainer = textView.textContainer else { return }
+            guard !textView.string.isEmpty else { return }
+            layoutManager.ensureLayout(for: textContainer)
+            guard layoutManager.numberOfGlyphs > 0 else { return }
+
+            let safeCharacterIndex = min(max(anchor.characterIndex, 0), max((textView.string as NSString).length - 1, 0))
+            let glyphIndex = min(
+                layoutManager.glyphIndexForCharacter(at: safeCharacterIndex),
+                max(layoutManager.numberOfGlyphs - 1, 0)
+            )
+            let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            let lineY = lineRect.minY + textView.textContainerOrigin.y
+            let documentHeight = scrollView.documentView?.bounds.height ?? textView.bounds.height
+            let maxY = max(0, documentHeight - scrollView.contentView.bounds.height)
+            let targetY = min(max(lineY - anchor.offsetFromAnchorLine - 8, 0), maxY)
+
+            isRestoringVisualPosition = true
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
             scrollView.reflectScrolledClipView(scrollView.contentView)
-            didRestore = true
+            isRestoringVisualPosition = false
+            saveCurrentScrollRatio()
+
+            if clearAnchor {
+                visualAnchor = nil
+            }
+        }
+
+        func saveCurrentScrollRatio() {
+            guard didRestore else { return }
+            guard let scrollView, let documentView = scrollView.documentView else { return }
+            let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
+            guard maxY > 0 else { return }
+            let ratio = scrollView.contentView.bounds.origin.y / maxY
+            progressStore.saveTextPosition(ratio: ratio, characterIndex: currentTopCharacterIndex(), for: progressKey)
+        }
+
+        private func currentTopCharacterIndex() -> Int? {
+            guard let scrollView, let textView, let layoutManager = textView.layoutManager, let textContainer = textView.textContainer else { return nil }
+            layoutManager.ensureLayout(for: textContainer)
+            guard layoutManager.numberOfGlyphs > 0 else { return nil }
+            let visibleRect = scrollView.contentView.bounds
+            let anchorPointInTextView = NSPoint(x: visibleRect.minX, y: visibleRect.minY + 8)
+            let containerPoint = NSPoint(
+                x: anchorPointInTextView.x - textView.textContainerOrigin.x,
+                y: anchorPointInTextView.y - textView.textContainerOrigin.y
+            )
+            let glyphIndex = min(
+                layoutManager.glyphIndex(for: containerPoint, in: textContainer),
+                max(layoutManager.numberOfGlyphs - 1, 0)
+            )
+            return layoutManager.characterIndexForGlyph(at: glyphIndex)
         }
 
         func registerNavigationAndSearch() {
@@ -366,7 +527,7 @@ private struct ReaderTextView: NSViewRepresentable {
         textView.textContainer?.widthTracksTextView = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.font = NSFont.systemFont(ofSize: fontSize)
+        textView.font = readerFont(ofSize: fontSize)
         textView.string = text
 
         let scrollView = NSScrollView(frame: .zero)
@@ -388,19 +549,25 @@ private struct ReaderTextView: NSViewRepresentable {
         DispatchQueue.main.async {
             context.coordinator.restorePositionIfNeeded()
             context.coordinator.registerNavigationAndSearch()
+            context.coordinator.attachWindowResizeObserversIfNeeded(for: scrollView)
         }
         return scrollView
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.attachWindowResizeObserversIfNeeded(for: nsView)
         guard let textView = nsView.documentView as? NSTextView else { return }
         if textView.string != text {
-            textView.string = text
+            context.coordinator.preserveVisualPosition {
+                textView.string = text
+            }
         }
 
         let currentSize = textView.font?.pointSize ?? 0
         if abs(currentSize - fontSize) > 0.1 {
-            textView.font = NSFont.systemFont(ofSize: fontSize)
+            context.coordinator.preserveVisualPosition {
+                textView.font = readerFont(ofSize: fontSize)
+            }
         }
 
         textView.textColor = nsColor(for: fontColor)
@@ -416,6 +583,7 @@ private struct ReaderTextView: NSViewRepresentable {
             name: NSView.boundsDidChangeNotification,
             object: nsView.contentView
         )
+        coordinator.detachWindowResizeObservers()
         coordinator.unregisterNavigationAndSearch()
     }
 
@@ -426,6 +594,12 @@ private struct ReaderTextView: NSViewRepresentable {
         case .black:
             return .black
         }
+    }
+
+    private func readerFont(ofSize size: Double) -> NSFont {
+        NSFont(name: "Songti SC", size: size)
+            ?? NSFont(name: "STSong", size: size)
+            ?? NSFont.systemFont(ofSize: size)
     }
 }
 
@@ -445,6 +619,9 @@ private struct ReaderHTMLView: NSViewRepresentable {
         var lastHTMLBody: String?
         var pendingStyleScript: String?
         var pendingInitialRestoreRatio: Double?
+        var pendingInitialRestoreBlockID: String?
+        var pendingInitialRestoreBlockOffset: Double?
+        var didCompleteInitialRestore = false
         var progressKey: String = ""
         var searchOwnerID: String = ""
         var tocOwnerID: String = ""
@@ -458,16 +635,29 @@ private struct ReaderHTMLView: NSViewRepresentable {
             webView.evaluateJavaScript(script, completionHandler: nil)
             pendingStyleScript = nil
 
-            if let ratio = pendingInitialRestoreRatio {
+            let restoreRatio = pendingInitialRestoreRatio
+            let restoreBlockID = pendingInitialRestoreBlockID
+            let restoreBlockOffset = pendingInitialRestoreBlockOffset
+            pendingInitialRestoreRatio = nil
+            pendingInitialRestoreBlockID = nil
+            pendingInitialRestoreBlockOffset = nil
+
+            if restoreRatio != nil || restoreBlockID != nil {
+                let ratio = restoreRatio ?? 0
+                let blockIDLiteral = restoreBlockID.flatMap(Self.jsStringLiteral) ?? "null"
+                let blockOffsetLiteral = restoreBlockOffset.map { "\($0)" } ?? "null"
                 let script = """
                 (() => {
-                  const body = document.body;
-                  const max = Math.max(0, body.scrollHeight - window.innerHeight);
-                  window.scrollTo(0, \(ratio) * max);
+                  window.__readerRestoreInitialPosition && window.__readerRestoreInitialPosition(\(ratio), \(blockIDLiteral), \(blockOffsetLiteral));
                 })();
                 """
-                webView.evaluateJavaScript(script, completionHandler: nil)
-                pendingInitialRestoreRatio = nil
+                webView.evaluateJavaScript(script) { _, _ in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        self.didCompleteInitialRestore = true
+                    }
+                }
+            } else {
+                didCompleteInitialRestore = true
             }
         }
 
@@ -530,8 +720,11 @@ private struct ReaderHTMLView: NSViewRepresentable {
                         navigationManager.updateCanGoBack(depth > 0)
                     }
                 case "scroll":
+                    guard didCompleteInitialRestore else { return }
                     let ratio = payload["ratio"] as? Double ?? 0
-                    progressStore.saveTextScrollRatio(ratio, for: progressKey)
+                    let blockID = payload["blockID"] as? String
+                    let blockOffset = payload["blockOffset"] as? Double
+                    progressStore.saveHTMLPosition(ratio: ratio, blockID: blockID, blockOffset: blockOffset, for: progressKey)
                 default:
                     break
                 }
@@ -765,7 +958,11 @@ private struct ReaderHTMLView: NSViewRepresentable {
         context.coordinator.searchOwnerID = "html:\(progressKey)"
         context.coordinator.tocItems = tableOfContents
         context.coordinator.tocOwnerID = "toc:html:\(progressKey)"
-        context.coordinator.pendingInitialRestoreRatio = context.coordinator.progressStore.progress(for: progressKey)?.textScrollRatio
+        let initialProgress = context.coordinator.progressStore.progress(for: progressKey)
+        context.coordinator.pendingInitialRestoreRatio = initialProgress?.textScrollRatio
+        context.coordinator.pendingInitialRestoreBlockID = initialProgress?.htmlBlockID
+        context.coordinator.pendingInitialRestoreBlockOffset = initialProgress?.htmlBlockOffset
+        context.coordinator.didCompleteInitialRestore = false
         context.coordinator.webView = webView
         webView.setValue(false, forKey: "drawsBackground")
         webView.loadHTMLString(htmlDocument(for: htmlBody), baseURL: nil)
@@ -789,7 +986,11 @@ private struct ReaderHTMLView: NSViewRepresentable {
             context.coordinator.progressKey = progressKey
             context.coordinator.searchOwnerID = "html:\(progressKey)"
             context.coordinator.tocOwnerID = "toc:html:\(progressKey)"
-            context.coordinator.pendingInitialRestoreRatio = context.coordinator.progressStore.progress(for: progressKey)?.textScrollRatio
+            let progress = context.coordinator.progressStore.progress(for: progressKey)
+            context.coordinator.pendingInitialRestoreRatio = progress?.textScrollRatio
+            context.coordinator.pendingInitialRestoreBlockID = progress?.htmlBlockID
+            context.coordinator.pendingInitialRestoreBlockOffset = progress?.htmlBlockOffset
+            context.coordinator.didCompleteInitialRestore = false
             context.coordinator.registerSearchProvider()
             context.coordinator.registerTOCProvider()
         }
@@ -800,6 +1001,11 @@ private struct ReaderHTMLView: NSViewRepresentable {
             context.coordinator.lastHTMLBody = htmlBody
             context.coordinator.lastStyleSignature = styleSignature
             context.coordinator.pendingStyleScript = styleUpdateScript(preservingPosition: false)
+            let progress = context.coordinator.progressStore.progress(for: progressKey)
+            context.coordinator.pendingInitialRestoreRatio = progress?.textScrollRatio
+            context.coordinator.pendingInitialRestoreBlockID = progress?.htmlBlockID
+            context.coordinator.pendingInitialRestoreBlockOffset = progress?.htmlBlockOffset
+            context.coordinator.didCompleteInitialRestore = false
             nsView.loadHTMLString(htmlDocument(for: htmlBody), baseURL: nil)
             return
         }
@@ -835,8 +1041,8 @@ private struct ReaderHTMLView: NSViewRepresentable {
               background: transparent;
             }
             body {
-              font-family: -apple-system, BlinkMacSystemFont, \"Helvetica Neue\", Helvetica, Arial, sans-serif;
-              font-size: var(--reader-font-size, 22px);
+              font-family: \"Songti SC\", STSong, \"SimSun\", serif;
+              font-size: var(--reader-font-size, 16px);
               line-height: 1.65;
               color: var(--reader-font-color, #FFFFFF);
               -webkit-text-size-adjust: 100%;
@@ -891,15 +1097,23 @@ private struct ReaderHTMLView: NSViewRepresentable {
         return """
         (() => {
           const root = document.documentElement;
-          const body = document.body;
-          const maxBefore = Math.max(0, body.scrollHeight - window.innerHeight);
-          const ratio = maxBefore > 0 ? (window.scrollY / maxBefore) : 0;
+          if (window.__readerCaptureResizeAnchor) {
+            window.__readerCaptureResizeAnchor();
+          }
           root.style.setProperty('--reader-font-size', '\(size)px');
           root.style.setProperty('--reader-font-color', '\(colorHex)');
-          requestAnimationFrame(() => {
-            const maxAfter = Math.max(0, body.scrollHeight - window.innerHeight);
-            window.scrollTo(0, ratio * maxAfter);
-          });
+          let attempts = 0;
+          const restore = () => {
+            const ok = window.__readerRestoreResizeAnchor && window.__readerRestoreResizeAnchor();
+            attempts += 1;
+            if (attempts < 6) {
+              requestAnimationFrame(restore);
+            } else {
+              window.__readerResizeAnchor = null;
+              window.__readerResizeRatioStart = null;
+            }
+          };
+          requestAnimationFrame(restore);
         })();
         """
     }
@@ -970,6 +1184,33 @@ private struct ReaderHTMLView: NSViewRepresentable {
             return false;
           };
           window.__readerJumpToHref = jumpToHref;
+          window.__readerRestoreInitialPosition = (ratio, blockID, blockOffset) => {
+            const targetRatio = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+            let attempts = 0;
+            const restore = () => {
+              if (blockID) {
+                window.__readerResizeAnchor = {
+                  id: blockID,
+                  offset: Number.isFinite(blockOffset) ? blockOffset : 0
+                };
+                const ok = window.__readerRestoreResizeAnchor && window.__readerRestoreResizeAnchor();
+                if (!ok) {
+                  const max = Math.max(0, document.body.scrollHeight - window.innerHeight);
+                  window.scrollTo(0, targetRatio * max);
+                }
+              } else {
+                const max = Math.max(0, document.body.scrollHeight - window.innerHeight);
+                window.scrollTo(0, targetRatio * max);
+              }
+              attempts += 1;
+              if (attempts < 12) {
+                requestAnimationFrame(restore);
+              } else {
+                window.__readerResizeAnchor = null;
+              }
+            };
+            requestAnimationFrame(restore);
+          };
           const clearSearchMarks = () => {
             const marks = Array.from(document.querySelectorAll('mark.reader-search-hit'));
             for (const mark of marks) {
@@ -1080,17 +1321,22 @@ private struct ReaderHTMLView: NSViewRepresentable {
             }
             return null;
           };
-          window.__readerResizeAnchor = null;
-          window.__readerResizeRatioStart = null;
-          window.__readerCaptureResizeAnchor = () => {
+          const currentReaderAnchor = () => {
             ensureReaderBlockIDs();
             const top = findTopVisibleBlock();
-            if (!top) return false;
+            if (!top) return null;
             const rect = top.getBoundingClientRect();
-            window.__readerResizeAnchor = {
+            return {
               id: top.getAttribute('data-reader-block-id'),
               offset: 8 - rect.top
             };
+          };
+          window.__readerResizeAnchor = null;
+          window.__readerResizeRatioStart = null;
+          window.__readerCaptureResizeAnchor = () => {
+            const anchor = currentReaderAnchor();
+            if (!anchor) return false;
+            window.__readerResizeAnchor = anchor;
             return true;
           };
           window.__readerRestoreResizeAnchor = () => {
@@ -1152,7 +1398,13 @@ private struct ReaderHTMLView: NSViewRepresentable {
             scrollTimer = setTimeout(() => {
               const max = Math.max(0, document.body.scrollHeight - window.innerHeight);
               const ratio = max > 0 ? (window.scrollY / max) : 0;
-              postReaderMessage({ type: 'scroll', ratio });
+              const anchor = currentReaderAnchor();
+              postReaderMessage({
+                type: 'scroll',
+                ratio,
+                blockID: anchor ? anchor.id : null,
+                blockOffset: anchor ? anchor.offset : null
+              });
             }, 120);
           }, { passive: true });
         })();
@@ -1180,6 +1432,7 @@ private struct ReaderPDFView: NSViewRepresentable {
         weak var pdfView: PDFView?
         var progressKey: String = ""
         var pendingRestorePageIndex: Int?
+        var didRestoreInitialPage = false
         var pageStack: [Int] = []
         var searchSelections: [PDFSelection] = []
         var searchOwnerID: String = ""
@@ -1187,6 +1440,7 @@ private struct ReaderPDFView: NSViewRepresentable {
         var tocItems: [BookTOCItem] = []
 
         @objc func onPDFPageChanged(_ notification: Notification) {
+            guard didRestoreInitialPage else { return }
             guard let pdfView = notification.object as? PDFView else { return }
             guard let document = pdfView.document, let currentPage = pdfView.currentPage else { return }
             let index = document.index(for: currentPage)
@@ -1195,15 +1449,20 @@ private struct ReaderPDFView: NSViewRepresentable {
 
         func preparePendingRestore() {
             pendingRestorePageIndex = progressStore.progress(for: progressKey)?.pdfPageIndex
+            didRestoreInitialPage = false
         }
 
         func restorePageIfAvailable() {
-            guard let pageIndex = pendingRestorePageIndex else { return }
+            guard let pageIndex = pendingRestorePageIndex else {
+                didRestoreInitialPage = true
+                return
+            }
             guard let pdfView, let document = pdfView.document else { return }
             let safeIndex = min(max(pageIndex, 0), max(document.pageCount - 1, 0))
             guard let page = document.page(at: safeIndex) else { return }
             pdfView.go(to: page)
             pendingRestorePageIndex = nil
+            didRestoreInitialPage = true
         }
 
         func saveCurrentPageIfAvailable() {
@@ -1369,7 +1628,7 @@ private struct ReaderPDFView: NSViewRepresentable {
         }
         context.coordinator.tocItems = tableOfContents
         ReadingTOCManager.shared.refresh()
-        if context.coordinator.pendingRestorePageIndex == nil {
+        if !context.coordinator.didRestoreInitialPage && context.coordinator.pendingRestorePageIndex == nil {
             context.coordinator.preparePendingRestore()
         }
         guard context.coordinator.activeSecurityURL != url || nsView.document == nil else {

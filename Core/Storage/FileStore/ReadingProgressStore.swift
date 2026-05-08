@@ -2,6 +2,9 @@ import Foundation
 
 struct BookReadingProgress: Codable {
     var textScrollRatio: Double?
+    var textCharacterIndex: Int?
+    var htmlBlockID: String?
+    var htmlBlockOffset: Double?
     var pdfPageIndex: Int?
 }
 
@@ -32,6 +35,23 @@ final class ReadingProgressStore {
     func saveTextScrollRatio(_ ratio: Double, for sourcePath: String) {
         var progress = cache[sourcePath] ?? BookReadingProgress()
         progress.textScrollRatio = min(max(ratio, 0), 1)
+        cache[sourcePath] = progress
+        flush()
+    }
+
+    func saveTextPosition(ratio: Double, characterIndex: Int?, for sourcePath: String) {
+        var progress = cache[sourcePath] ?? BookReadingProgress()
+        progress.textScrollRatio = min(max(ratio, 0), 1)
+        progress.textCharacterIndex = characterIndex.map { max($0, 0) }
+        cache[sourcePath] = progress
+        flush()
+    }
+
+    func saveHTMLPosition(ratio: Double, blockID: String?, blockOffset: Double?, for sourcePath: String) {
+        var progress = cache[sourcePath] ?? BookReadingProgress()
+        progress.textScrollRatio = min(max(ratio, 0), 1)
+        progress.htmlBlockID = blockID
+        progress.htmlBlockOffset = blockOffset
         cache[sourcePath] = progress
         flush()
     }

@@ -13,7 +13,8 @@ enum PDFReadingMode: String, Equatable {
 struct ReaderPreferences: Equatable {
     var transparencyEnabled: Bool = false
     var opacity: Double = 1.0
-    var fontSize: Double = 18.0
+    var fontSize: Double = 16.0
+    var fontName: String = "Songti SC"
     var fontColor: ReaderFontColor = .white
     var pdfReadingMode: PDFReadingMode = .original
 }

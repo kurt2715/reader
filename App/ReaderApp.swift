@@ -170,8 +170,8 @@ private struct ReaderCommands: Commands {
             Button(fontLabel("14", value: 14)) {
                 windowManager.setFontSize(14)
             }
-            Button(fontLabel("18", value: 18)) {
-                windowManager.setFontSize(18)
+            Button(fontLabel("16", value: 16)) {
+                windowManager.setFontSize(16)
             }
             Button(fontLabel("22", value: 22)) {
                 windowManager.setFontSize(22)
