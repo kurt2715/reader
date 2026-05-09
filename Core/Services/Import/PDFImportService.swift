@@ -21,14 +21,22 @@ final class PDFImportService {
             }
         }
 
-        guard PDFDocument(url: url) != nil else {
+        guard let document = PDFDocument(url: url) else {
             throw PDFImportError.unreadableFile(url)
         }
 
-        let title = url.deletingPathExtension().lastPathComponent
-        let document = PDFDocument(url: url)
-        let toc = document.map(extractTOC(from:)) ?? []
-        return Book(title: title, sourceURL: url, format: .pdf, tableOfContents: toc)
+        let fallbackTitle = url.deletingPathExtension().lastPathComponent
+        let title = cleanMetadataValue(document.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String) ?? fallbackTitle
+        let author = cleanMetadataValue(document.documentAttributes?[PDFDocumentAttribute.authorAttribute] as? String)
+        let toc = extractTOC(from: document)
+        return Book(title: title, author: author, sourceURL: url, format: .pdf, tableOfContents: toc)
+    }
+
+    private func cleanMetadataValue(_ value: String?) -> String? {
+        guard let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines), !cleaned.isEmpty else {
+            return nil
+        }
+        return cleaned
     }
 
     private func extractTOC(from document: PDFDocument) -> [BookTOCItem] {

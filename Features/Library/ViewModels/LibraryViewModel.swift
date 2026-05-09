@@ -36,6 +36,7 @@ final class LibraryViewModel: ObservableObject {
         self.catalogStore = catalogStore
 
         loadCatalog()
+        refreshCatalogMetadataIfNeeded()
     }
 
     func importFiles(from urls: [URL], completion: @escaping ([Book]) -> Void) {
@@ -122,9 +123,10 @@ final class LibraryViewModel: ObservableObject {
 
                 switch result {
                 case let .success(hydratedBook):
-                    self.mergeImportedBooks([hydratedBook])
+                    let bookToOpen = hydratedBook.preservingCustomMetadata(from: book)
+                    self.mergeImportedBooks([bookToOpen])
                     self.persistCatalog()
-                    completion(hydratedBook)
+                    completion(bookToOpen)
                 case let .failure(error):
                     self.importErrorMessage = error.localizedDescription
                     completion(nil)
@@ -135,6 +137,19 @@ final class LibraryViewModel: ObservableObject {
 
     func removeBookFromLibrary(_ book: Book) {
         books.removeAll { $0.id == book.id }
+        persistCatalog()
+    }
+
+    func updateMetadata(for book: Book, title: String, author: String?) {
+        let cleanedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedTitle.isEmpty else { return }
+
+        let cleanedAuthor = author?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedAuthor = cleanedAuthor?.isEmpty == false ? cleanedAuthor : nil
+
+        guard let index = books.firstIndex(where: { $0.id == book.id }) else { return }
+        books[index] = books[index].replacingMetadata(title: cleanedTitle, author: normalizedAuthor)
+        books.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         persistCatalog()
     }
 
@@ -179,7 +194,7 @@ final class LibraryViewModel: ObservableObject {
         var mergedBooks = books
         for book in importedBooks {
             if let existingIndex = mergedBooks.firstIndex(where: { $0.sourceURL == book.sourceURL }) {
-                mergedBooks[existingIndex] = book
+                mergedBooks[existingIndex] = book.preservingCustomMetadata(from: mergedBooks[existingIndex])
             } else {
                 mergedBooks.append(book)
             }
@@ -198,8 +213,10 @@ final class LibraryViewModel: ObservableObject {
 
             return Book(
                 title: entry.title,
+                author: entry.author,
                 sourceURL: url,
-                format: format
+                format: format,
+                usesCustomMetadata: entry.usesCustomMetadata ?? false
             )
         }
 
@@ -207,10 +224,53 @@ final class LibraryViewModel: ObservableObject {
         persistCatalog()
     }
 
+    private func refreshCatalogMetadataIfNeeded() {
+        let candidates = books.filter { book in
+            switch book.format {
+            case .txt:
+                return false
+            case .pdf, .epub, .mobi, .azw3:
+                if book.usesCustomMetadata { return false }
+                return book.author == nil || book.title == book.sourceURL.deletingPathExtension().lastPathComponent
+            }
+        }
+        guard !candidates.isEmpty else { return }
+
+        let txtService = txtImportService
+        let pdfService = pdfImportService
+        let epubService = epubImportService
+        let calibreService = calibreEBookImportService
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var refreshedBooks: [Book] = []
+            for book in candidates {
+                guard let refreshed = try? Self.importBook(
+                    from: book.sourceURL,
+                    txtService: txtService,
+                    pdfService: pdfService,
+                    epubService: epubService,
+                    calibreService: calibreService
+                ) else {
+                    continue
+                }
+                refreshedBooks.append(refreshed)
+            }
+
+            guard !refreshedBooks.isEmpty else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.mergeImportedBooks(refreshedBooks)
+                self.persistCatalog()
+            }
+        }
+    }
+
     private func persistCatalog() {
         let entries = books.map {
             PersistedBookEntry(
                 title: $0.title,
+                author: $0.author,
+                usesCustomMetadata: $0.usesCustomMetadata,
                 sourcePath: $0.sourceURL.path,
                 formatRawValue: $0.format.rawValue
             )

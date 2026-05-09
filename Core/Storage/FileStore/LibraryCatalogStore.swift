@@ -2,6 +2,8 @@ import Foundation
 
 struct PersistedBookEntry: Codable {
     let title: String
+    let author: String?
+    let usesCustomMetadata: Bool?
     let sourcePath: String
     let formatRawValue: String
 }

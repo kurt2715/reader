@@ -45,10 +45,12 @@ final class CalibreEBookImportService {
         }
 
         let extracted = try epubImportService.extractContent(from: conversionResult.outputURL)
-        let title = url.deletingPathExtension().lastPathComponent
+        let fallbackTitle = url.deletingPathExtension().lastPathComponent
+        let title = extracted.metadata.title ?? fallbackTitle
 
         return Book(
             title: title,
+            author: extracted.metadata.author,
             sourceURL: url,
             format: format,
             textContent: extracted.plainText,

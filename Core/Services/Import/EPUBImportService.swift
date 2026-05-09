@@ -4,6 +4,12 @@ struct EPUBExtractedContent {
     let plainText: String
     let richHTML: String
     let tableOfContents: [BookTOCItem]
+    let metadata: EPUBMetadata
+}
+
+struct EPUBMetadata {
+    let title: String?
+    let author: String?
 }
 
 private struct NCXNode {
@@ -57,6 +63,61 @@ private final class NCXParserDelegate: NSObject, XMLParserDelegate {
     }
 }
 
+private final class OPFMetadataParserDelegate: NSObject, XMLParserDelegate {
+    var title: String?
+    var author: String?
+
+    private var activeElement: String?
+    private var textBuffer = ""
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        let element = (qName ?? elementName).lowercased()
+        if element == "dc:title" || element == "title" || element.hasSuffix(":title") {
+            activeElement = "title"
+            textBuffer = ""
+        } else if element == "dc:creator" || element == "creator" || element.hasSuffix(":creator") {
+            activeElement = "creator"
+            textBuffer = ""
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard activeElement != nil else { return }
+        textBuffer += string
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        guard let activeElement else { return }
+        let element = (qName ?? elementName).lowercased()
+        let shouldCloseTitle = activeElement == "title" && (element == "dc:title" || element == "title" || element.hasSuffix(":title"))
+        let shouldCloseCreator = activeElement == "creator" && (element == "dc:creator" || element == "creator" || element.hasSuffix(":creator"))
+        guard shouldCloseTitle || shouldCloseCreator else { return }
+
+        let value = textBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.isEmpty {
+            if activeElement == "title", title == nil {
+                title = value
+            } else if activeElement == "creator", author == nil {
+                author = value
+            }
+        }
+        self.activeElement = nil
+        textBuffer = ""
+    }
+}
+
+private final class EPUBContainerParserDelegate: NSObject, XMLParserDelegate {
+    var rootfilePath: String?
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        guard rootfilePath == nil else { return }
+        let element = (qName ?? elementName).lowercased()
+        if element == "rootfile", let path = attributeDict["full-path"]?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            rootfilePath = path
+        }
+    }
+}
+
 enum EPUBImportError: LocalizedError {
     case unzipFailed
     case emptyContent(URL)
@@ -81,9 +142,11 @@ final class EPUBImportService {
         }
 
         let extracted = try extractContent(from: url)
-        let title = url.deletingPathExtension().lastPathComponent
+        let fallbackTitle = url.deletingPathExtension().lastPathComponent
+        let title = extracted.metadata.title ?? fallbackTitle
         return Book(
             title: title,
+            author: extracted.metadata.author,
             sourceURL: url,
             format: .epub,
             textContent: extracted.plainText,
@@ -115,6 +178,7 @@ final class EPUBImportService {
             throw EPUBImportError.unzipFailed
         }
 
+        let metadata = extractMetadata(in: tempDir)
         let htmlFiles = collectHTMLFiles(in: tempDir)
         let chapterAnchors = buildChapterAnchors(htmlFiles: htmlFiles, rootDir: tempDir)
         let tocItems = extractTOCItems(in: tempDir, chapterAnchors: chapterAnchors)
@@ -160,8 +224,51 @@ final class EPUBImportService {
         return EPUBExtractedContent(
             plainText: joinedText,
             richHTML: joinedHTML,
-            tableOfContents: tocItems
+            tableOfContents: tocItems,
+            metadata: metadata
         )
+    }
+
+    private func extractMetadata(in rootDir: URL) -> EPUBMetadata {
+        guard let opfURL = locateOPFFile(in: rootDir), let data = try? Data(contentsOf: opfURL) else {
+            return EPUBMetadata(title: nil, author: nil)
+        }
+
+        let parser = XMLParser(data: data)
+        let delegate = OPFMetadataParserDelegate()
+        parser.delegate = delegate
+        guard parser.parse() else {
+            return EPUBMetadata(title: nil, author: nil)
+        }
+        return EPUBMetadata(title: delegate.title, author: delegate.author)
+    }
+
+    private func locateOPFFile(in rootDir: URL) -> URL? {
+        let containerURL = rootDir.appendingPathComponent("META-INF/container.xml")
+        if let data = try? Data(contentsOf: containerURL) {
+            let parser = XMLParser(data: data)
+            let delegate = EPUBContainerParserDelegate()
+            parser.delegate = delegate
+            if parser.parse(), let rootfilePath = delegate.rootfilePath {
+                let opfURL = rootDir.appendingPathComponent(rootfilePath)
+                if FileManager.default.fileExists(atPath: opfURL.path) {
+                    return opfURL
+                }
+            }
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        for case let fileURL as URL in enumerator where fileURL.pathExtension.lowercased() == "opf" {
+            return fileURL
+        }
+        return nil
     }
 
     private func extractTOCItems(in rootDir: URL, chapterAnchors: [String: String]) -> [BookTOCItem] {

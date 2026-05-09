@@ -174,6 +174,7 @@ private struct ReaderTextView: NSViewRepresentable {
         var positionStack: [Double] = []
         var searchOwnerID: String
         var tocOwnerID: String
+        var appliedTextStyleSignature: String?
 
         struct TextVisualAnchor {
             let characterIndex: Int
@@ -343,6 +344,18 @@ private struct ReaderTextView: NSViewRepresentable {
             guard maxY > 0 else { return }
             let ratio = scrollView.contentView.bounds.origin.y / maxY
             progressStore.saveTextPosition(ratio: ratio, characterIndex: currentTopCharacterIndex(), for: progressKey)
+        }
+
+        func page(by direction: Int) {
+            guard let scrollView, let documentView = scrollView.documentView else { return }
+            let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
+            guard maxY > 0 else { return }
+            let pageHeight = max(1, scrollView.contentView.bounds.height * 0.9)
+            let currentY = scrollView.contentView.bounds.origin.y
+            let targetY = min(max(currentY + CGFloat(direction) * pageHeight, 0), maxY)
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            saveCurrentScrollRatio()
         }
 
         private func currentTopCharacterIndex() -> Int? {
@@ -515,8 +528,24 @@ private struct ReaderTextView: NSViewRepresentable {
         Coordinator(progressKey: progressKey, tableOfContents: tableOfContents)
     }
 
+    final class PagingTextView: NSTextView {
+        weak var readerCoordinator: Coordinator?
+
+        override func keyDown(with event: NSEvent) {
+            switch event.specialKey {
+            case .leftArrow:
+                readerCoordinator?.page(by: -1)
+            case .rightArrow:
+                readerCoordinator?.page(by: 1)
+            default:
+                super.keyDown(with: event)
+            }
+        }
+    }
+
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView(frame: .zero)
+        let textView = PagingTextView(frame: .zero)
+        textView.readerCoordinator = context.coordinator
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
@@ -527,12 +556,13 @@ private struct ReaderTextView: NSViewRepresentable {
         textView.textContainer?.widthTracksTextView = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.font = readerFont(ofSize: fontSize)
         textView.string = text
+        applyTextStyle(to: textView)
+        context.coordinator.appliedTextStyleSignature = textStyleSignature
 
         let scrollView = NSScrollView(frame: .zero)
         scrollView.drawsBackground = false
-        scrollView.hasVerticalScroller = true
+        scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.documentView = textView
@@ -560,17 +590,17 @@ private struct ReaderTextView: NSViewRepresentable {
         if textView.string != text {
             context.coordinator.preserveVisualPosition {
                 textView.string = text
+                applyTextStyle(to: textView)
+                context.coordinator.appliedTextStyleSignature = textStyleSignature
             }
         }
 
-        let currentSize = textView.font?.pointSize ?? 0
-        if abs(currentSize - fontSize) > 0.1 {
+        if context.coordinator.appliedTextStyleSignature != textStyleSignature {
             context.coordinator.preserveVisualPosition {
-                textView.font = readerFont(ofSize: fontSize)
+                applyTextStyle(to: textView)
+                context.coordinator.appliedTextStyleSignature = textStyleSignature
             }
         }
-
-        textView.textColor = nsColor(for: fontColor)
 
         DispatchQueue.main.async {
             context.coordinator.restorePositionIfNeeded()
@@ -600,6 +630,33 @@ private struct ReaderTextView: NSViewRepresentable {
         NSFont(name: "Songti SC", size: size)
             ?? NSFont(name: "STSong", size: size)
             ?? NSFont.systemFont(ofSize: size)
+    }
+
+    private var textStyleSignature: String {
+        "\(Int(fontSize.rounded()))|\(fontColor.rawValue)"
+    }
+
+    private func applyTextStyle(to textView: NSTextView) {
+        let font = readerFont(ofSize: fontSize)
+        let color = nsColor(for: fontColor)
+        textView.font = font
+        textView.textColor = color
+        textView.typingAttributes = [
+            .font: font,
+            .foregroundColor: color
+        ]
+
+        let fullRange = NSRange(location: 0, length: (textView.string as NSString).length)
+        guard fullRange.length > 0 else { return }
+        textView.textStorage?.beginEditing()
+        textView.textStorage?.addAttributes(
+            [
+                .font: font,
+                .foregroundColor: color
+            ],
+            range: fullRange
+        )
+        textView.textStorage?.endEditing()
     }
 }
 
@@ -767,6 +824,11 @@ private struct ReaderHTMLView: NSViewRepresentable {
                     self.navigationManager.updateCanGoBack(depth > 0)
                 }
             }
+        }
+
+        func page(by direction: Int) {
+            guard let webView else { return }
+            webView.evaluateJavaScript("window.__readerPage && window.__readerPage(\(direction));", completionHandler: nil)
         }
 
         func registerSearchProvider() {
@@ -941,6 +1003,21 @@ private struct ReaderHTMLView: NSViewRepresentable {
         Coordinator()
     }
 
+    final class PagingWebView: WKWebView {
+        weak var readerCoordinator: Coordinator?
+
+        override func keyDown(with event: NSEvent) {
+            switch event.specialKey {
+            case .leftArrow:
+                readerCoordinator?.page(by: -1)
+            case .rightArrow:
+                readerCoordinator?.page(by: 1)
+            default:
+                super.keyDown(with: event)
+            }
+        }
+    }
+
     func makeNSView(context: Context) -> WKWebView {
         let userContentController = WKUserContentController()
         userContentController.add(context.coordinator, name: "readerNav")
@@ -952,7 +1029,8 @@ private struct ReaderHTMLView: NSViewRepresentable {
 
         let config = WKWebViewConfiguration()
         config.userContentController = userContentController
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = PagingWebView(frame: .zero, configuration: config)
+        webView.readerCoordinator = context.coordinator
         webView.navigationDelegate = context.coordinator
         context.coordinator.progressKey = progressKey
         context.coordinator.searchOwnerID = "html:\(progressKey)"
@@ -1039,6 +1117,13 @@ private struct ReaderHTMLView: NSViewRepresentable {
               margin: 0;
               padding: 0;
               background: transparent;
+              scrollbar-width: none;
+            }
+            html::-webkit-scrollbar,
+            body::-webkit-scrollbar {
+              width: 0 !important;
+              height: 0 !important;
+              display: none;
             }
             body {
               font-family: \"Songti SC\", STSong, \"SimSun\", serif;
@@ -1047,6 +1132,10 @@ private struct ReaderHTMLView: NSViewRepresentable {
               color: var(--reader-font-color, #FFFFFF);
               -webkit-text-size-adjust: 100%;
               word-wrap: break-word;
+            }
+            body * {
+              font-size: var(--reader-font-size, 16px) !important;
+              color: var(--reader-font-color, #FFFFFF);
             }
             p, div, section, article, blockquote, li {
               margin: 0.45em 0;
@@ -1070,6 +1159,29 @@ private struct ReaderHTMLView: NSViewRepresentable {
             }
             mark.reader-search-hit.reader-search-active {
               background: rgba(255, 95, 95, 0.65);
+            }
+            #reader-footnote-popover {
+              position: fixed;
+              z-index: 2147483647;
+              max-width: min(360px, calc(100vw - 32px));
+              max-height: 45vh;
+              overflow: auto;
+              box-sizing: border-box;
+              padding: 12px 14px;
+              border: 1px solid rgba(127,127,127,0.32);
+              border-radius: 8px;
+              background: rgba(246,246,246,0.96);
+              color: #111111;
+              box-shadow: 0 8px 28px rgba(0,0,0,0.26);
+              font-size: calc(var(--reader-font-size, 16px) * 0.92) !important;
+              line-height: 1.55;
+              backdrop-filter: blur(12px);
+              -webkit-backdrop-filter: blur(12px);
+            }
+            #reader-footnote-popover.reader-dark {
+              background: rgba(28,28,30,0.96);
+              color: #f5f5f7;
+              border-color: rgba(255,255,255,0.22);
             }
           </style>
         </head>
@@ -1148,6 +1260,11 @@ private struct ReaderHTMLView: NSViewRepresentable {
               window.webkit.messageHandlers.readerNav.postMessage(payload);
             }
           };
+          window.__readerPage = (direction) => {
+            const step = Math.max(1, window.innerHeight * 0.9);
+            window.scrollBy(0, (direction < 0 ? -1 : 1) * step);
+            return window.scrollY;
+          };
           const normalizeAnchor = (raw) => {
             if (!raw) return '';
             let value = raw;
@@ -1159,31 +1276,102 @@ private struct ReaderHTMLView: NSViewRepresentable {
           };
           const jumpToHref = (href) => {
             if (!href) return false;
-            let fragment = '';
-            if (href.startsWith('#')) {
-              fragment = href.slice(1);
-            } else {
-              const hashIndex = href.indexOf('#');
-              if (hashIndex >= 0) fragment = href.slice(hashIndex + 1);
-            }
+            const fragment = fragmentFromHref(href);
             if (!fragment) return false;
+            const target = findTargetForFragment(fragment);
+            if (!target) return false;
+            target.scrollIntoView({ block: 'start', inline: 'nearest' });
+            return true;
+          };
+          window.__readerJumpToHref = jumpToHref;
+          const fragmentFromHref = (href) => {
+            if (!href) return '';
+            if (href.startsWith('#')) return href.slice(1);
+            const hashIndex = href.indexOf('#');
+            return hashIndex >= 0 ? href.slice(hashIndex + 1) : '';
+          };
+          const findTargetForFragment = (fragment) => {
+            if (!fragment) return null;
             const candidates = Array.from(new Set([fragment, normalizeAnchor(fragment)]))
               .filter(Boolean);
             for (const key of candidates) {
               const byId = document.getElementById(key);
-              if (byId) {
-                byId.scrollIntoView({ block: 'start', inline: 'nearest' });
-                return true;
-              }
+              if (byId) return byId;
               const byName = document.getElementsByName(key);
-              if (byName && byName.length > 0) {
-                byName[0].scrollIntoView({ block: 'start', inline: 'nearest' });
-                return true;
-              }
+              if (byName && byName.length > 0) return byName[0];
             }
-            return false;
+            return null;
           };
-          window.__readerJumpToHref = jumpToHref;
+          const closeFootnotePopover = () => {
+            const existing = document.getElementById('reader-footnote-popover');
+            if (existing) existing.remove();
+          };
+          const footnoteContainerFor = (target) => {
+            if (!target) return null;
+            const container = target.closest('li, aside, section, p, div');
+            return container || target;
+          };
+          const hasFootnoteHint = (el) => {
+            if (!el) return false;
+            const attrs = [
+              el.getAttribute('role') || '',
+              el.getAttribute('epub:type') || '',
+              el.getAttribute('class') || '',
+              el.getAttribute('id') || '',
+              el.getAttribute('name') || ''
+            ].join(' ').toLowerCase();
+            return attrs.includes('footnote') || attrs.includes('endnote') || /\\bfn(ref)?\\b/.test(attrs) || /\\bnote(ref)?\\b/.test(attrs);
+          };
+          const isLikelyFootnoteLink = (anchor, target) => {
+            const text = (anchor.textContent || '').replace(/\\s+/g, '').trim();
+            const markerLike = /^\\[?[0-9０-９一二三四五六七八九十百千]+[\\]\\)]?$/.test(text)
+              || /^\\[?[ivxlcdm]+[\\]\\)]?$/i.test(text);
+            if (markerLike) return true;
+            return hasFootnoteHint(anchor) || hasFootnoteHint(target) || hasFootnoteHint(footnoteContainerFor(target));
+          };
+          const cleanedFootnoteText = (container, marker) => {
+            const clone = container.cloneNode(true);
+            clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
+            clone.querySelectorAll('a[href^="#"]').forEach(el => {
+              const text = (el.textContent || '').trim();
+              if (/^(↩|戻る|back|return)$/i.test(text) || text.length <= 2) {
+                el.remove();
+              }
+            });
+            let text = (clone.textContent || '').replace(/\\s+/g, ' ').trim();
+            const rawMarker = (marker || '').replace(/[\\[\\]\\(\\)]/g, '').trim();
+            if (rawMarker) {
+              const escaped = rawMarker.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+              text = text.replace(new RegExp(`^\\\\[?${escaped}\\\\]?\\\\s*`), '').trim();
+            }
+            return text;
+          };
+          const showFootnotePopover = (anchor, target) => {
+            const container = footnoteContainerFor(target);
+            if (!container) return false;
+            const text = cleanedFootnoteText(container, anchor.textContent || '');
+            if (!text) return false;
+            closeFootnotePopover();
+            const popover = document.createElement('div');
+            popover.id = 'reader-footnote-popover';
+            if ((getComputedStyle(document.body).color || '').includes('255')) {
+              popover.classList.add('reader-dark');
+            }
+            popover.textContent = text;
+            document.body.appendChild(popover);
+
+            const anchorRect = anchor.getBoundingClientRect();
+            const popRect = popover.getBoundingClientRect();
+            const margin = 12;
+            let left = Math.min(Math.max(margin, anchorRect.left), window.innerWidth - popRect.width - margin);
+            let top = anchorRect.bottom + 8;
+            if (top + popRect.height + margin > window.innerHeight) {
+              top = Math.max(margin, anchorRect.top - popRect.height - 8);
+            }
+            popover.style.left = `${left}px`;
+            popover.style.top = `${top}px`;
+            return true;
+          };
           window.__readerRestoreInitialPosition = (ratio, blockID, blockOffset) => {
             const targetRatio = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
             let attempts = 0;
@@ -1377,8 +1565,15 @@ private struct ReaderHTMLView: NSViewRepresentable {
             }, 140);
           }, { passive: true });
           document.addEventListener('click', (event) => {
+            const popover = document.getElementById('reader-footnote-popover');
+            if (popover && event.target && popover.contains(event.target)) {
+              return;
+            }
             const anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
-            if (!anchor) return;
+            if (!anchor) {
+              closeFootnotePopover();
+              return;
+            }
             const href = anchor.getAttribute('href') || '';
             const lower = href.toLowerCase();
             if (!href || lower.startsWith('javascript:') || lower.startsWith('mailto:')) return;
@@ -1386,6 +1581,13 @@ private struct ReaderHTMLView: NSViewRepresentable {
             if (isExternal) return;
             const isInternal = href.startsWith('#') || (!lower.includes('://')) || lower.startsWith('file://') || href.includes('#');
             if (!isInternal) return;
+            const target = findTargetForFragment(fragmentFromHref(href));
+            if (target && isLikelyFootnoteLink(anchor, target) && showFootnotePopover(anchor, target)) {
+              event.preventDefault();
+              event.stopPropagation();
+              return;
+            }
+            closeFootnotePopover();
             const depth = window.__readerPushPos();
             postReaderMessage({ type: 'stack', depth });
             if (jumpToHref(href)) {
@@ -1537,6 +1739,19 @@ private struct ReaderPDFView: NSViewRepresentable {
             navigationManager.updateCanGoBack(!pageStack.isEmpty)
         }
 
+        func page(by direction: Int) {
+            guard let pdfView,
+                  let document = pdfView.document,
+                  let currentPage = pdfView.currentPage else {
+                return
+            }
+            let currentIndex = document.index(for: currentPage)
+            let targetIndex = min(max(currentIndex + direction, 0), max(document.pageCount - 1, 0))
+            guard targetIndex != currentIndex, let targetPage = document.page(at: targetIndex) else { return }
+            pdfView.go(to: targetPage)
+            progressStore.savePDFPageIndex(targetIndex, for: progressKey)
+        }
+
         func search(query: String) -> [ReaderSearchResult] {
             guard let document = pdfView?.document else { return [] }
             let selections = document.findString(query, withOptions: [.caseInsensitive, .diacriticInsensitive])
@@ -1595,12 +1810,29 @@ private struct ReaderPDFView: NSViewRepresentable {
         Coordinator()
     }
 
+    final class PagingPDFView: PDFView {
+        weak var readerCoordinator: Coordinator?
+
+        override func keyDown(with event: NSEvent) {
+            switch event.specialKey {
+            case .leftArrow:
+                readerCoordinator?.page(by: -1)
+            case .rightArrow:
+                readerCoordinator?.page(by: 1)
+            default:
+                super.keyDown(with: event)
+            }
+        }
+    }
+
     func makeNSView(context: Context) -> PDFView {
-        let pdfView = PDFView(frame: .zero)
+        let pdfView = PagingPDFView(frame: .zero)
+        pdfView.readerCoordinator = context.coordinator
         pdfView.autoScales = true
         pdfView.displayMode = .singlePageContinuous
         pdfView.displayDirection = .vertical
         pdfView.backgroundColor = .clear
+        hideScrollers(in: pdfView)
         context.coordinator.pdfView = pdfView
         context.coordinator.progressKey = progressKey
         context.coordinator.searchOwnerID = "pdf:\(progressKey)"
@@ -1619,6 +1851,7 @@ private struct ReaderPDFView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: PDFView, context: Context) {
+        hideScrollers(in: nsView)
         context.coordinator.progressKey = progressKey
         if context.coordinator.searchOwnerID != "pdf:\(progressKey)" {
             context.coordinator.unregisterNavigationAndSearch()
@@ -1669,10 +1902,21 @@ private struct ReaderPDFView: NSViewRepresentable {
         context.coordinator.preparePendingRestore()
         pdfView.document = PDFDocument(url: url)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            hideScrollers(in: pdfView)
             context.coordinator.restorePageIfAvailable()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            hideScrollers(in: pdfView)
             context.coordinator.restorePageIfAvailable()
         }
+    }
+
+    private func hideScrollers(in view: NSView) {
+        if let scrollView = view as? NSScrollView {
+            scrollView.hasVerticalScroller = false
+            scrollView.hasHorizontalScroller = false
+            scrollView.autohidesScrollers = true
+        }
+        view.subviews.forEach { hideScrollers(in: $0) }
     }
 }
